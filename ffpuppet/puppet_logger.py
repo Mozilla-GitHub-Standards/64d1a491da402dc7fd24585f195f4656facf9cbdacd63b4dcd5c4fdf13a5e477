@@ -17,8 +17,9 @@ __all__ = ("PuppetLogger")
 
 
 class PuppetLogger(object):
-    LOG_ASAN_PREFIX = "ffp_asan_%d.log" % os.getpid() # prefix for ASan logs
-    LOG_BUF_SIZE = 0x10000 # buffer size used to copy logs
+    PREFIX_ASAN = "ffp_asan"
+    PREFIX_VALGRIND = "ffp_valgrind"
+    LOG_BUF_SIZE = 0x10000  # buffer size used to copy logs
 
     def __init__(self):
         self._logs = dict()

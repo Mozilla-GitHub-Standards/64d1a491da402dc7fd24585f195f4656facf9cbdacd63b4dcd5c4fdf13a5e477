@@ -186,16 +186,22 @@ class FFPuppet(object):
         if self.reason is not None or not self.is_running():
             return False
 
-        return False if self._find_dumps() else True
+        return False if self._find_dumps(limit=1) else True
 
 
-    def _find_dumps(self):
+    def _find_dumps(self, limit=None):
         dumps = list()
-        # check for *San logs
+        # check for *San & Valgrind logs
         if os.path.isdir(self._logs.working_path):
             for fname in os.listdir(self._logs.working_path):
-                if fname.startswith(self._logs.LOG_ASAN_PREFIX):
+                if fname.startswith(self._logs.PREFIX_ASAN):
                     dumps.append(os.path.join(self._logs.working_path, fname))
+                elif self._use_valgrind and fname.startswith(self._logs.PREFIX_VALGRIND):
+                    full_path = os.path.join(self._logs.working_path, fname)
+                    if os.path.getsize(full_path) > 0:
+                        dumps.append(full_path)
+                if limit and len(dumps) >= limit:
+                    break
 
         # check for minidumps
         md_path = os.path.join(self.profile, "minidumps")
@@ -203,6 +209,8 @@ class FFPuppet(object):
             for fname in os.listdir(md_path):
                 if ".dmp" in fname:
                     dumps.append(os.path.join(md_path, fname))
+                if limit and len(dumps) >= limit:
+                    break
 
         return dumps
 
@@ -288,6 +296,7 @@ class FFPuppet(object):
         assert self._proc is not None
         assert isinstance(kill_delay, (float, int)) and kill_delay >= 0
         log.debug("_terminate(kill_delay=%0.2f) called", kill_delay)
+        debug_proc = None
         try:
             target = psutil.Process(self._proc.pid)
         except psutil.NoSuchProcess:
@@ -296,7 +305,22 @@ class FFPuppet(object):
             procs = target.children()
         except psutil.NoSuchProcess:
             procs = list()
+        # handle valgrind
+        # TODO: this should be the same for most debuggers
+        if self._use_valgrind:
+            assert len(procs) < 2, "Valgrind should have max one child proc (browser parent)"
+            if procs:
+                debug_proc = target
+                target = procs[0]
+                try:
+                    procs = target.children()
+                except psutil.NoSuchProcess:
+                    procs = list()
+            else:
+                log.debug("Valgrind should exit on it's own...")
+                time.sleep(3)
         # iterate over child procs and then target proc
+        # the debugger if active should then exit without calling terminate on it
         for proc in procs + [target]:
             try:
                 proc.terminate()
@@ -310,7 +334,10 @@ class FFPuppet(object):
                 procs = target.children(recursive=True)
             except psutil.NoSuchProcess:
                 procs = list()
-            for proc in procs + [target]:
+            procs.append(target)
+            if debug_proc is not None:
+                procs.append(debug_proc)
+            for proc in procs:
                 try:
                     proc.kill()
                 except psutil.NoSuchProcess:
@@ -361,10 +388,7 @@ class FFPuppet(object):
             if self.is_running():
                 r_key = self.RC_CLOSED
                 log.debug("process needs to be terminated")
-                if self._use_valgrind:
-                    self._terminate(0.1)
-                else:
-                    self._terminate()
+                self._terminate()
             else:
                 r_key = self.RC_EXITED
             self._returncode = self.wait()
@@ -382,11 +406,14 @@ class FFPuppet(object):
         self._workers = list()
 
         if not force_close:
-            # scan for ASan logs
+            # scan for debugger (ASan, Valgrind) logs
             for fname in os.listdir(self._logs.working_path):
-                if not fname.startswith(self._logs.LOG_ASAN_PREFIX):
+                if not (fname.startswith(self._logs.PREFIX_ASAN) or
+                        fname.startswith(self._logs.PREFIX_VALGRIND)):
                     continue
                 tmp_file = os.path.join(self._logs.working_path, fname)
+                if os.path.getsize(tmp_file) < 1:
+                    continue  # ignore empty files
                 self._logs.add_log(fname, open(tmp_file, "rb"))
 
             # check for minidumps in the profile and dump them if possible
@@ -464,19 +491,21 @@ class FFPuppet(object):
             cmd.extend(additional_args)
 
         if self._use_valgrind:
+            log_prefix = os.path.join(self._logs.working_path, self._logs.PREFIX_VALGRIND)
             cmd = [
                 "valgrind",
                 "-q",
-                #"---error-limit=no",
-                "--smc-check=all-non-file",
+                "--error-exitcode=11",
+                "--leak-check=no",
+                "--log-file=%s.%%p" % log_prefix,
+                "--read-inline-info=yes",
                 "--show-mismatched-frees=no",
                 "--show-possibly-lost=no",
-                "--read-inline-info=yes",
-                #"--leak-check=full",
+                "--smc-check=all-non-file",
                 #"--track-origins=yes",
                 "--vex-iropt-register-updates=allregs-at-mem-access"] + cmd
 
-        if self._use_gdb:
+        elif self._use_gdb:
             cmd = [
                 "gdb",
                 "-nx",
@@ -499,9 +528,9 @@ class FFPuppet(object):
                 "-ex", "quit_with_code",
                 "-return-child-result",
                 "-batch",
-                "--args"] + cmd # enable gdb
+                "--args"] + cmd
 
-        if self._use_rr:
+        elif self._use_rr:
             cmd = ["rr", "record"] + cmd
 
         return cmd
@@ -586,9 +615,6 @@ class FFPuppet(object):
         if safe_mode:
             launch_args.insert(0, "-safe-mode")
 
-        cmd = self.build_launch_cmd(
-            bin_path,
-            additional_args=launch_args)
 
         if self._use_valgrind:
             if env_mod is None:
@@ -600,13 +626,17 @@ class FFPuppet(object):
         self._logs.reset() # clean up existing log files
         self._logs.add_log("stdout")
         stderr = self._logs.add_log("stderr")
+
+        # build launch command
+        cmd = self.build_launch_cmd(bin_path, additional_args=launch_args)
         stderr.write(b"[ffpuppet] Launch command: ")
         stderr.write(" ".join(cmd).encode("utf-8"))
         stderr.write(b"\n\n")
         stderr.flush()
-        sanitizer_logs = os.path.join(self._logs.working_path, self._logs.LOG_ASAN_PREFIX)
+
         # launch the browser
         log.debug("launch command: %r", " ".join(cmd))
+        sanitizer_logs = os.path.join(self._logs.working_path, self._logs.PREFIX_ASAN)
         self._proc = subprocess.Popen(
             cmd,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if self._platform == "windows" else 0,
@@ -632,9 +662,6 @@ class FFPuppet(object):
             # launch memory monitor thread
             self._workers.append(memory_limiter.MemoryLimiterWorker())
             self._workers[-1].start(self, memory_limit)
-
-        if self._use_valgrind:
-            self.add_abort_token(re.compile(r"==\d+==\s"))
 
         if self._abort_tokens:
             # launch log scanner thread

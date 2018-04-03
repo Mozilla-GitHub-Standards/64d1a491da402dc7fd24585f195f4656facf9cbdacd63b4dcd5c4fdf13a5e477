@@ -426,6 +426,10 @@ class PuppetTests(TestCase): # pylint: disable=too-many-public-methods
             with self.assertRaisesRegex(EnvironmentError, "Valgrind is only supported on Linux"):
                 FFPuppet(use_valgrind=True)
         else:
+            try:
+                subprocess.check_call(["which", "valgrind"])
+            except subprocess.CalledProcessError:
+                raise unittest.SkipTest("Valgrind is not installed")
             ffp = FFPuppet(use_valgrind=True)
             self.addCleanup(ffp.clean_up)
             bin_path = str(subprocess.check_output(["which", "echo"]).strip().decode("ascii"))
@@ -503,8 +507,8 @@ class PuppetTests(TestCase): # pylint: disable=too-many-public-methods
         self.addCleanup(ffp.clean_up)
         ffp.launch(TESTFF_BIN)
         test_logs = list()
-        asan_prefix = os.path.join(ffp._logs.working_path, ffp._logs.LOG_ASAN_PREFIX) # pylint: disable=protected-access
-        for i in range(3):
+        asan_prefix = os.path.join(ffp._logs.working_path, ffp._logs.PREFIX_ASAN) # pylint: disable=protected-access
+        for i in range(5120, 5123):
             test_logs.append(".".join([asan_prefix, str(i)]))
         # small log with nothing interesting
         with open(test_logs[0], "w") as log_fp:
@@ -531,14 +535,13 @@ class PuppetTests(TestCase): # pylint: disable=too-many-public-methods
         dir_list = os.listdir(self.logs)
         self.assertEqual(len(dir_list), 5)
         for fname in dir_list:
-            if not fname.startswith("log_ffp_asan_"):
+            if not fname.startswith("log_ffp_asan"):
                 self.assertIn(fname, ["log_stderr.txt", "log_stdout.txt"])
                 continue
             with open(os.path.join(self.logs, fname), "r") as log_fp:
                 self.assertIn(log_fp.readline(), ["BAD LOG\n", "GOOD LOG\n", "SHORT LOG\n"])
         ffp.clean_up()
-        for t_log in test_logs:
-            self.assertFalse(os.path.isfile(t_log))
+        self.assertFalse(any(os.path.isfile(t_log) for t_log in test_logs))
 
     def test_25(self):
         "test multiple minidumps"
@@ -631,9 +634,14 @@ class PuppetTests(TestCase): # pylint: disable=too-many-public-methods
             with self.assertRaisesRegex(EnvironmentError, "RR is only supported on Linux"):
                 FFPuppet(use_rr=True)
         else:
+            # check if rr is installed since we call it directly
+            try:
+                subprocess.check_call(["which", "rr"])
+            except subprocess.CalledProcessError:
+                raise unittest.SkipTest("rr is not installed")
             # TODO: this can hang if ptrace is blocked by seccomp
             proc = subprocess.Popen(["rr", "check"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = proc.communicate()
+            _, stderr = proc.communicate()
             proc.wait()
             if b"Unable to open performance counter" in stderr:
                 self.skipTest("This machine doesn't support performance counters needed by RR")
